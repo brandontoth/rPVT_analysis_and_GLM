@@ -1,5 +1,5 @@
-function output = glm_gaussian_v2
-%% define some constants and initialze arrays
+function output = glm_gaussian_v4
+%% define constants and initialize arrays
 files  = dir('*.mat');
 fs     = 1000;
 d_fs   = 50;
@@ -7,53 +7,73 @@ ds_f   = fs / d_fs;
 test   = 0.4;   
 dilate = [[-1, 4]; [0, 2]; [0, 8]];
 pred   = {'start_tone', 'correct_light', 'correct_poke', ...
-    'incorrect_light', 'incorrect_poke', 'om_light', ...
-    'premature_poke', 'consumption'};
+          'incorrect_light', 'incorrect_poke', 'om_light', ...
+          'premature_poke', 'consumption', 'velocity'};  % added velocity
 
-beh_train = []; % concat predictors for training
-act_train = []; % concat response for training
-beh_test  = []; % concat predictors for testing
-act_test  = []; % concat response for testing
-ons_test  = []; % concat behavior onsets for testing
-dff       = []; % concat total response for shuffle
-behav     = []; % concat total predictors for shuffle
+beh_train = []; % predictors for training
+act_train = []; % response for training
+beh_test  = []; % predictors for testing
+act_test  = []; % response for testing
+ons_test  = []; % behavior onsets for testing
+dff       = []; % total response for shuffle
+behav     = []; % total predictors for shuffle
+lag_counts_all = []; % lag counts for each predictor (excluding velocity)
 
-%% load all the data in and prepare basis matrices
+%% load data and prepare basis matrices
 for i = 1:length(files)
-    load(files(i).name)
-    
-    idx = src; idx.signal = [];
-    signal = src.signal;
-    
-    onsets = glm_onsets(idx, length(signal));
-    out    = nan(size(onsets, 1),  length(signal) / ds_f);
-    for k = 1:size(onsets, 1); out(k, :) = binvec(onsets(k, :), ds_f); end
+    load(files(i).name, 'src');
 
-    win = gausswin(d_fs + 1, 12);  % full width of ~1 s
-    win = win ./ sum(win);         % division here to prevent changes in amplitude
+    idx = src; 
+    signal = src.signal;
+
+    onsets = glm_onsets(idx, length(signal));
+    out    = nan(size(onsets, 1), ceil(length(signal) / ds_f));
+    for k = 1:size(onsets, 1)
+        out(k, :) = binvec(onsets(k, :), ds_f);
+    end
+
+    % light smoothing of dFF
+    win = gausswin(d_fs + 1, 12);  % ~1 s window
+    win = win ./ sum(win);
     signal = resample(signal, d_fs, fs);
     signal = conv(signal, win, 'same');
+
     behavior   = [];
     full_basis = [];
-    full_lags  = [];
-    
+    lag_counts = [];  % per predictor lag count (not including velocity)
+
+    % ----- existing predictors -----
     for k = 1:size(out, 1)
-        if contains(pred(k), ["light", "tone", "pellet"])
-            [lags, basis] = glm_basis(out(k, :), dilate(2, :), 10, d_fs);
-        elseif contains(pred(k), "poke")
-            [lags, basis] = glm_basis(out(k, :), dilate(1, :), 10, d_fs);
-        elseif contains(pred(k), "consumption")
-            [lags, basis] = glm_basis(out(k, :), dilate(3, :), 10, d_fs);
+        if contains(pred{k}, ["light", "tone", "pellet"])
+            [n_lags, basis] = glm_basis(out(k, :), dilate(2, :), 10, d_fs);
+        elseif contains(pred{k}, "poke")
+            [n_lags, basis] = glm_basis(out(k, :), dilate(1, :), 10, d_fs);
+        elseif contains(pred{k}, "consumption")
+            [n_lags, basis] = glm_basis(out(k, :), dilate(3, :), 10, d_fs);
         end
         full_basis = [full_basis; basis];
-        full_lags  = [full_lags;  lags];
+        lag_counts = [lag_counts; n_lags];
     end
-    
-    behavior = [behavior; full_basis];
-    
+
+    % ----- add velocity predictor if it exists in this session -----
+    if isfield(src, 'velocity') && ~isempty(src.velocity)
+        vel = resample(src.velocity, d_fs, fs);   % downsample
+        vel = zscore(vel);                        % z-score
+        full_basis = [full_basis; vel];           % append as one row
+        lag_counts = [lag_counts; 1];             % velocity has 1 lag
+    else
+        full_basis = [full_basis; zeros(1, size(full_basis, 2))]; % fill zeros
+        lag_counts = [lag_counts; 1];
+    end
+
+    behavior = full_basis;
+
+    % normalize session predictors (excluding velocity, already zscored)
+    behavior(1:end-1, :) = zscore(behavior(1:end-1, :), 0, 2);
+
     nframes  = size(signal, 2);
-    train_fr = 1:(1 - test) * nframes;
-    test_fr  = length(train_fr):nframes;
+    train_fr = 1:floor((1 - test) * nframes);
+    test_fr  = train_fr(end) + 1:nframes;
 
     beh_train = [beh_train behavior(:, train_fr)];
     beh_test  = [beh_test  behavior(:, test_fr)];
@@ -64,109 +84,108 @@ for i = 1:length(files)
 
     dff   = [dff   signal];
     behav = [behav behavior];
+    lag_counts_all = [lag_counts_all; lag_counts];
 end
 
-%% let's run our GLM
-fprintf('running GLM\n')
+%% run GLM
+fprintf('Running GLM...\n')
 
-opts.alpha = 0.01;  % The regularization parameter
+opts.alpha = 0.01;  
 opts.standardize = true; 
-options   = glmnetSet(opts);  % Set the options to use
+options = glmnetSet(opts);
 
-% use sparse here to help with computation time
 glmoutput = cvglmnet(sparse(beh_train'), act_train', 'gaussian', ...
-                options, 'deviance', [], [], false, false, true);
+                     options, 'deviance', [], [], false, false, true);
 
-% Default to the most regularized solution within 1 SE of the cross-validated minimum error
 coeffs   = cvglmnetCoef(glmoutput, 'lambda_1se'); 
 actpred  = cvglmnetPredict(glmoutput, beh_test', 'lambda_1se', 'response');
 fraction = zeros(1, length(pred) + 1);
 [fraction(1), ~, ~] = getDeviance(act_test, actpred, mean(act_train), 'Gaussian');
 
-% light smoothing of predicted activity for visualization
 act_pred = smooth(actpred);
 
-%% get individual contributions for predictors within GLM and sum them
-% idividual contributions for each predictor
-% can leave out the intercept for this
+%% compute individual predictor contributions
 idv_act = beh_test .* coeffs(2:end);
 
 for i = 1:length(coeffs) - 1
     newcoeffs = coeffs(2:end);
     newcoeffs(setdiff(1:length(newcoeffs), i)) = 0;
-    
     [fraction(i + 1), ~, ~] = getDeviance(act_test, idv_act(i, :), ...
-                        mean(act_train), 'Gaussian');
+                                mean(act_train), 'Gaussian');
 end
 
-%% recombine deviance
-% remove negative fractions
 fraction(fraction < 0) = 0;
-
-% percent deviation for every predictor
 explain = [fraction(1) 100 * fraction(2:end) / sum(fraction(2:end))];
 
-% combine percentages across like predictors
-sum_fraction = zeros(1, size(pred, 2) + 1);
+% combine lag contributions per predictor
+sum_fraction = zeros(1, numel(pred) + 1);
 sum_fraction(1) = fraction(1);
 
-str = 2;
-for i = 1:size(pred, 2)
-    sum_fraction(i + 1) = sum(explain(str:str + full_lags(i) - 1));
-%     fprintf('str idx: %f end idx: %f \n', str, str + full_lags(i) - 1)
-    str = str + full_lags(i);
+start_idx = 2;
+for i = 1:numel(pred)
+    end_idx = start_idx + lag_counts_all(i) - 1;
+    sum_fraction(i + 1) = sum(explain(start_idx:end_idx));
+    start_idx = end_idx + 1;
 end
 
-% devex = sum_fraction;
-% devex(devex <= 0) = 0;
-% for i = 2:length(sum_fraction); devex(i) = devex(i) ./ devex(1); end
+sum_activity = zeros(numel(pred), size(idv_act, 2));
+start_idx = 1;
+for i = 1:numel(pred)
+    end_idx = start_idx + lag_counts_all(i) - 1;
+    sum_activity(i, :) = smooth(sum(idv_act(start_idx:end_idx, :)));
+    start_idx = end_idx + 1;
+end
 
-% combine individual contributions for like predictors
-sum_activity = zeros(size(pred, 2), size(idv_act, 2));
-str = 1;
-for i = 1:size(pred, 2)
-    sum_activity(i, :) = smooth(sum(idv_act(str:str + full_lags(i) - 1, :)));
-%     fprintf('str idx: %f end idx: %f \n', str, str + full_lags(i) - 1)
-    str = str + full_lags(i);
-end 
-
-%% shuffle GLM by circular shifting dff
-% shuffled glm
-fprintf('shuffling GLM\n')
-
+%% shuffle control
+fprintf('Running shuffled GLM (50 iterations)...\n')
 n_iter = 50;
+shuffled_glm = cell(1, n_iter);
+
 for curr_boot = 1:n_iter
     time_range = 15 * d_fs;
-
     circshift_val = randsample(time_range:length(dff), 1);
-    CVerr_boot    = cvglmnet(sparse(behav'), circshift(dff, circshift_val)', 'gaussian', ...
-        options, 'deviance', [], [], false, false, true);
+
+    CVerr_boot = cvglmnet(sparse(behav'), circshift(dff, circshift_val)', ...
+                          'gaussian', options, 'deviance', [], [], false, false, true);
     coeff_shuff   = cvglmnetCoef(CVerr_boot);
-    
     pred_test_shuff = cvglmnetPredict(CVerr_boot, beh_test', [], 'response');
-    
-    [A, B, C] = getDeviance(circshift(act_test, circshift_val), ...
-        (pred_test_shuff), mean(dff), 'Gaussian');
-    
-    shuffled_glm{curr_boot}.GLM           = CVerr_boot;
-    shuffled_glm{curr_boot}.circshift_val = circshift_val;
-    shuffled_glm{curr_boot}.deviance      = [A B C];
+
+    [A, B, C] = getDeviance(circshift(act_test, circshift_val), pred_test_shuff, ...
+                            mean(dff), 'Gaussian');
+
+    shuffled_glm{curr_boot} = struct( ...
+        'GLM', CVerr_boot, ...
+        'coeffs', coeff_shuff, ...
+        'circshift_val', circshift_val, ...
+        'deviance', [A B C]);
 end
 
-%% put it all into a structure and save
-output.fraction      = fraction;
-output.coefficients  = coeffs;
-output.dev_explain   = sum_fraction;
-output.predictors    = pred;
-output.pred_activity = act_pred;
-output.test_behavior = beh_test;
-output.test_activity = act_test;
-output.idv_activity  = idv_act;
-output.onsets        = ons_test;
-output.shuffled      = shuffled_glm;
-output.glm           = glmoutput;
-output.sum_activity  = sum_activity;
-output.lags          = full_lags;
+%% output
+output = struct( ...
+    'fraction', fraction, ...
+    'coefficients', coeffs, ...
+    'dev_explain', sum_fraction, ...
+    'predictors', {pred}, ...
+    'pred_activity', act_pred, ...
+    'test_behavior', beh_test, ...
+    'test_activity', act_test, ...
+    'idv_activity', idv_act, ...
+    'onsets', ons_test, ...
+    'shuffled', {shuffled_glm}, ...
+    'glm', glmoutput, ...
+    'sum_activity', sum_activity, ...
+    'lags', lag_counts_all);
+
+[path, name, ~] = fileparts(pwd);
+out_dir = fullfile('..', 'glm_output');
+if ~exist(out_dir, 'dir'); mkdir(out_dir); end
+save(fullfile(out_dir, [name '_glm_output.mat']), 'output');
+
+fprintf('GLM complete. Saved to %s\n', fullfile(out_dir, [name '_glm_output.mat']));
+cd('..')
+
+end
+
 
 % [path, name, ~] = fileparts(pwd);
 % save([path '\glm_output\' name '_glm_output.mat'], 'output')
@@ -206,7 +225,7 @@ function [lags, basis] = glm_basis(onsets, dilate, spacing, fs)
     % Make it a basis matrix if necessary
     dilateframes = [round(dilate(1) * fs), round(dilate(2) * fs)];
     if dilateframes(1) == 0 && dilateframes(2) == 0
-        basis = conv(basis, norm, 'same');
+        basis = conv(basis, win, 'same');
     else
         i = -spacing;
         while i >= dilateframes(1)
